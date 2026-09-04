@@ -1,0 +1,6 @@
+[project]
+name = "demo-crm-contacts-connector"
+version = "0.1.0"
+description = "Dummy product event source for CI/CD demonstrations"
+requires-python = ">=3.14,<3.15"
+dependencies = []

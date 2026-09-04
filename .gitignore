@@ -1,0 +1,20 @@
+# Python and uv
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Connector SDK local outputs
+**/files/
+**/warehouse.db
+**/state.json
+
+# Terraform
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+.terraform.lock.hcl
+
+# Operating system
+.DS_Store

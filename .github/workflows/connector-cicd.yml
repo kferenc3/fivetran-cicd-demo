@@ -1,0 +1,249 @@
+name: Connector CI/CD
+
+on:
+  pull_request:
+    paths:
+      - "connectors/**"
+      - "terraform/**"
+      - "pyproject.toml"
+      - "uv.lock"
+      - ".github/workflows/connector-cicd.yml"
+
+  push:
+    branches:
+      - main
+    paths:
+      - "connectors/**"
+      - "terraform/**"
+      - "pyproject.toml"
+      - "uv.lock"
+      - ".github/workflows/connector-cicd.yml"
+
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  detect:
+    name: Detect changed connectors
+    runs-on: ubuntu-latest
+
+    outputs:
+      connectors: ${{ steps.changes.outputs.connectors }}
+      has_changes: ${{ steps.changes.outputs.has_changes }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Detect changes
+        id: changes
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PULL_REQUEST_BASE: ${{ github.event.pull_request.base.sha }}
+          PUSH_BASE: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+
+          supported_connectors=(
+            "billing_invoices"
+            "crm_contacts"
+            "product_events"
+            "support_tickets"
+          )
+
+          declare -A selected=()
+          shared_change=false
+          changed_files=()
+
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            shared_change=true
+          else
+            if [[ "$EVENT_NAME" == "pull_request" ]]; then
+              base_sha="$PULL_REQUEST_BASE"
+            else
+              base_sha="$PUSH_BASE"
+            fi
+
+            if [[ -z "$base_sha" || "$base_sha" =~ ^0+$ ]] ||
+              ! git cat-file -e "$base_sha^{commit}" 2>/dev/null; then
+              mapfile -t changed_files < <(
+                git show --pretty="" --name-only "$GITHUB_SHA"
+              )
+            else
+              mapfile -t changed_files < <(
+                git diff --name-only "$base_sha" "$GITHUB_SHA"
+              )
+            fi
+
+            for file in "${changed_files[@]}"; do
+              case "$file" in
+                terraform/* | pyproject.toml | uv.lock | .github/workflows/connector-cicd.yml)
+                  shared_change=true
+                  ;;
+              esac
+
+              if [[ "$file" =~ ^connectors/([^/]+)/ ]]; then
+                connector="${BASH_REMATCH[1]}"
+
+                for supported in "${supported_connectors[@]}"; do
+                  if [[ "$connector" == "$supported" ]]; then
+                    selected["$connector"]=1
+                  fi
+                done
+              fi
+            done
+          fi
+
+          if [[ "$shared_change" == "true" ]]; then
+            for connector in "${supported_connectors[@]}"; do
+              selected["$connector"]=1
+            done
+          fi
+
+          if (( ${#selected[@]} == 0 )); then
+            connectors_json="[]"
+            has_changes=false
+          else
+            connectors_json="$(
+              printf '%s\n' "${!selected[@]}" |
+                sort |
+                jq -R . |
+                jq -sc .
+            )"
+            has_changes=true
+          fi
+
+          echo "Selected connectors: $connectors_json"
+          echo "connectors=$connectors_json" >> "$GITHUB_OUTPUT"
+          echo "has_changes=$has_changes" >> "$GITHUB_OUTPUT"
+
+  terraform-check:
+    name: Validate Terraform
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Install Terraform
+        uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: 1.16.1
+          terraform_wrapper: false
+
+      - name: Check Terraform formatting
+        run: terraform fmt -check -recursive
+
+      - name: Initialize Terraform without remote state
+        run: terraform -chdir=terraform init -backend=false -input=false
+
+      - name: Validate Terraform
+        run: terraform -chdir=terraform validate
+
+  validate-connectors:
+    name: Validate ${{ matrix.connector }}
+    needs:
+      - detect
+
+    if: needs.detect.outputs.has_changes == 'true'
+
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        connector: ${{ fromJSON(needs.detect.outputs.connectors) }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.0.1
+        with:
+          version: latest-known
+          enable-cache: true
+
+      - name: Install Python
+        run: uv python install 3.14
+
+      - name: Install project dependencies
+        run: uv sync --locked --dev
+
+      - name: Debug connector
+        run: uv run fivetran debug "connectors/${{ matrix.connector }}"
+
+      - name: Package connector
+        run: uv run fivetran package "connectors/${{ matrix.connector }}" --yes
+
+  deploy-connectors:
+    name: Deploy ${{ matrix.connector }}
+    needs:
+      - detect
+      - terraform-check
+      - validate-connectors
+
+    if: >
+      github.event_name != 'pull_request' &&
+      needs.detect.outputs.has_changes == 'true'
+
+    runs-on: ubuntu-latest
+
+    environment:
+      name: dev
+
+    strategy:
+      fail-fast: false
+      matrix:
+        connector: ${{ fromJSON(needs.detect.outputs.connectors) }}
+
+    concurrency:
+      group: fivetran-deploy-${{ matrix.connector }}
+      cancel-in-progress: false
+
+    env:
+      FIVETRAN_APIKEY: ${{ secrets.FIVETRAN_APIKEY }}
+      FIVETRAN_APISECRET: ${{ secrets.FIVETRAN_APISECRET }}
+      TF_TOKEN_app_terraform_io: ${{ secrets.TF_API_TOKEN }}
+      TF_VAR_group_id: ${{ vars.FIVETRAN_GROUP_ID }}
+      TF_VAR_connector_name: ${{ matrix.connector }}
+      TF_WORKSPACE: fivetran-sdk-${{ matrix.connector }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.0.1
+        with:
+          version: latest-known
+          enable-cache: true
+
+      - name: Install Python
+        run: uv python install 3.14
+
+      - name: Install project dependencies
+        run: uv sync --locked --dev
+
+      - name: Package connector
+        run: uv run fivetran package "connectors/${{ matrix.connector }}" --yes
+
+      - name: Install Terraform
+        uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: 1.16.1
+          terraform_wrapper: false
+
+      - name: Initialize Terraform
+        run: terraform -chdir=terraform init -input=false
+
+      - name: Create Terraform plan
+        run: terraform -chdir=terraform plan -input=false -out=tfplan
+
+      - name: Apply Terraform plan
+        run: terraform -chdir=terraform apply -input=false tfplan

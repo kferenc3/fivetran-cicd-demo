@@ -6,20 +6,13 @@ readme = "README.md"
 authors = [
     { name = "Ferenc Kiss", email = "kissferenc1988@outlook.com" }
 ]
-requires-python = ">=3.14"
+requires-python = ">=3.14,<3.15"
 dependencies = []
 
 [dependency-groups]
 dev = [
     "fivetran-connector-sdk>=2.11.0",
 ]
-
-[project.scripts]
-fivetran-cicd-demo = "fivetran_cicd_demo:main"
-
-[build-system]
-requires = ["uv_build>=0.12.9,<0.13.0"]
-build-backend = "uv_build"
 
 [tool.uv]
 package=false
